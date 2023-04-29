@@ -6,13 +6,14 @@ from Simulator import champion, origin_class
 import Simulator.utils as utils
 import Simulator.config as config
 from Simulator.item_stats import basic_items, item_builds, thieves_gloves_items, \
-    starting_items, trait_items, uncraftable_items
+    starting_items, trait_items, uncraftable_items, items
 
 from Simulator.stats import COST
 from Simulator.pool_stats import cost_star_values
 from Simulator.origin_class_stats import tiers, fortune_returns
 from math import floor
 from config import DEBUG
+from config import SPARSE_IMAGE_OBS
 
 """
 Description - This is the base player class
@@ -77,11 +78,19 @@ class Player:
         # Encoding board as an image, so we can run convolutions on it.
         self.board_vector = np.zeros(728)  # 26 size on each unit, 28 squares
         self.bench_vector = np.zeros(config.BENCH_SIZE * config.CHAMP_ENCODING_SIZE)
+        
+        # if config setting:
+        # Image vectors
+        self.sparse_public_image_vector = np.zeros((16, 16, 128))
+        self.sparse_private_image_vector = np.zeros((16, 16, 128))
+      
 
         self.decision_mask = np.ones(6, dtype=np.int8)
         self.shop_mask = np.ones(5, dtype=np.int8)
         # locations of champions on the board, 1 for spot taken 0 for not
         self.board_mask = np.ones(28, dtype=np.int8)
+        # locations of champions on the board that have full items, 1 for full items 0 for not
+        self.board_full_items_mask = np.ones(28, dtype=np.int8)
         # locations of units that are not champions on the board
         self.dummy_mask = np.ones(28, dtype=np.int8)
         # locations of champions on the bench, 1 for spot taken 0 for not
@@ -114,7 +123,7 @@ class Player:
         self.item_reward = 0
         self.won_game_reward = 0
         self.prev_rewards = 0
-        self.damage_reward = 1.25
+        self.damage_reward = 1.5
 
         # Everyone shares the pool object.
         # Required for buying champions to and from the pool
@@ -297,7 +306,8 @@ class Player:
             self.reward += self.mistake_reward
             self.decision_mask[4] = 0
             if DEBUG:
-                print("Did not have gold to buy_exp")
+                print(f"Did not have gold to buy exp, had {self.gold}, needed {self.exp_cost}, "
+                      f"was level {self.level}, mask {self.decision_mask[4]}")
             return False
         self.gold -= 4
         # self.reward += 0.02
@@ -342,6 +352,7 @@ class Player:
                             break
                 if found_position:
                     break
+        self.print(f"Spaces for units left to fight {self.max_units - self.num_units_in_play}")
         # update board to survive combat = False, will update after combat if they survived
         # update board to participated in combat
         for x in range(len(self.board)):
@@ -412,18 +423,142 @@ class Player:
                   If there is no unit on the square, 0s will fill that position. Stars and cost are not binary
     """
     def generate_board_vector(self):
-        for y in range(0, 4):
-            # IMPORTANT TO HAVE THE X INSIDE -- Silver is not sure why but ok.
-            for x in range(0, 7):
+        
+        
+        if SPARSE_IMAGE_OBS:
+            image_board_vector = np.zeros((4, 7, 128))
+            for y in range(0, 4):
+                # IMPORTANT TO HAVE THE X INSIDE -- Silver is not sure why but ok.
+                for x in range(0, 7):
+                    # when using binary encoding (6 champ  + stars + chosen + 3 * 6 item) = 26
+                    if self.board[x][y]:
+                        curr_champ = self.board[x][y]                        
+                        image_board_vector[x, y, 0] = 1
+                        c_index = list(COST.keys()).index(curr_champ.name)
+                        image_board_vector[x, y, c_index + 1] = 1
+                        image_board_vector[x, y, 61 + curr_champ.stars] = 1
+                        
+                        for ind, item in enumerate(curr_champ.items):
+                            image_board_vector[x, y, 65 + list(items).index(item)] += 1
+    
+                        if self.board[x][y].target_dummy:
+                            image_board_vector[x, y, 61] = 1    
+                        # Masking
+                        if len(curr_champ.items) == 3:
+                            self.board_full_items_mask[7 * y + x] = 1
+                        else:
+                            self.board_full_items_mask[7 * y + x] = 0
+                        if len(curr_champ.items) > 0 and curr_champ.items[-1] == "sparring_gloves":
+                            self.glove_item_mask[7 * y + x] = 1
+                        # Check for target_dummy or azir sandguard
+                        if self.board[x][y].target_dummy:
+                            self.dummy_mask[7 * y + x] = 1
+                        else:
+                            self.dummy_mask[7 * y + x] = 0
+                        self.board_mask[7 * y + x] = 1
+                    else:
+                        # Different from the board vector because it needs to match the MCTS encoder
+                        self.board_mask[7 * y + x] = 0
+                        self.glove_item_mask[7 * y + x] = 0
+                        self.dummy_mask[7 * y + x] = 0
+                        self.board_full_items_mask[7 * y + x] = 0
+            self.sparse_private_image_vector[1:5, 1:8, :] = image_board_vector
+            self.sparse_public_image_vector[1:5, 1:8, :] = image_board_vector
+
+        else:
+            for y in range(0, 4):
+                # IMPORTANT TO HAVE THE X INSIDE -- Silver is not sure why but ok.
+                for x in range(0, 7):
+                    # when using binary encoding (6 champ  + stars + chosen + 3 * 6 item) = 26
+                    champion_info_array = np.zeros(6 * 4 + 2)
+                    if self.board[x][y]:
+                        curr_champ = self.board[x][y]
+                        c_index = list(COST.keys()).index(curr_champ.name)
+                        champion_info_array[0:6] = utils.champ_binary_encode(c_index)
+                        champion_info_array[6] = curr_champ.stars / 3
+                        champion_info_array[7] = curr_champ.cost / 5
+                        for ind, item in enumerate(curr_champ.items):
+                            start = (ind * 6) + 7
+                            finish = start + 6
+                            i_index = []
+                            if item in uncraftable_items:
+                                i_index = list(uncraftable_items).index(item) + 1
+                            elif item in item_builds.keys():
+                                i_index = list(item_builds.keys()).index(item) + 1 + len(uncraftable_items)
+                            champion_info_array[start:finish] = utils.item_binary_encode(i_index)
+    
+                        # Masking
+                        if len(curr_champ.items) == 3:
+                            self.board_full_items_mask[7 * y + x] = 1
+                        else:
+                            self.board_full_items_mask[7 * y + x] = 0
+                        if len(curr_champ.items) > 0 and curr_champ.items[-1] == "sparring_gloves":
+                            self.glove_item_mask[7 * y + x] = 1
+                        # Check for target_dummy or azir sandguard
+                        if self.board[x][y].target_dummy:
+                            self.dummy_mask[7 * y + x] = 1
+                        else:
+                            self.dummy_mask[7 * y + x] = 0
+                        self.board_mask[7 * y + x] = 1
+                    else:
+                        # Different from the board vector because it needs to match the MCTS encoder
+                        self.board_mask[7 * y + x] = 0
+                        self.glove_item_mask[7 * y + x] = 0
+                        self.dummy_mask[7 * y + x] = 0
+                        self.board_full_items_mask[7 * y + x] = 0
+    
+                    # Fit the area into the designated spot in the vector
+                    self.board_vector[x * 4 + y:x * 4 + y + 26] = champion_info_array
+    
+            if self.num_units_in_play == self.max_units:
+                self.util_mask[0] = 0
+            else:
+                self.util_mask[0] = 1
+
+    """
+    Description - Generates the bench vector. The same encoding style for the board is used for the bench.
+    """
+    def generate_bench_vector(self):
+        
+        if SPARSE_IMAGE_OBS:
+            space = 0
+            image_bench_vector = np.zeros((1, 9, 128))
+            for x_bench in range(len(self.bench)):
+                if self.bench[x_bench]:
+                    curr_champ = self.bench[x_bench]                        
+                    image_bench_vector[0, x_bench, 0] = 1
+                    c_index = list(COST.keys()).index(curr_champ.name)
+                    image_bench_vector[0, x_bench, c_index + 1] = 1
+                    image_bench_vector[0, x_bench, 61 + curr_champ.stars] = 1
+                    
+                    for ind, item in enumerate(curr_champ.items):
+                        image_bench_vector[0, x_bench, 65 + list(items).index(item)] += 1
+                    
+                    self.bench_mask[x_bench] = 1
+                    if len(curr_champ.items) > 0 and curr_champ.items[-1] == "sparring_gloves":
+                        self.glove_item_mask[x_bench + 27] = 1
+                
+                else:
+                    space = 1
+                    if x_bench == 9:
+                        print("length of bench = {}".format(len(self.bench)))
+                    self.bench_mask[x_bench] = 0
+                    self.glove_item_mask[x_bench + 27] = 0
+            
+            self.sparse_private_image_vector[6, 1:10, :] = image_bench_vector
+            self.sparse_public_image_vector[6, 1:10, :] = image_bench_vector            
+            
+            self.util_mask[1] = space
+        
+        else:
+        
+            space = 0
+            bench = np.zeros(config.BENCH_SIZE * config.CHAMP_ENCODING_SIZE)
+            for x_bench in range(len(self.bench)):
                 # when using binary encoding (6 champ  + stars + chosen + 3 * 6 item) = 26
                 champion_info_array = np.zeros(6 * 4 + 2)
-                if self.board[x][y]:
-                    # Check for target_dummy or azir sandguard
-                    if self.board[x][y].target_dummy or self.board[x][y].overlord_coordinates is not None:
-                        self.dummy_mask[7 * y + x] = 1
-
-                    self.board_mask[7 * y + x] = 1
-                    curr_champ = self.board[x][y]
+                if self.bench[x_bench]:
+                    curr_champ = self.bench[x_bench]
                     c_index = list(COST.keys()).index(curr_champ.name)
                     champion_info_array[0:6] = utils.champ_binary_encode(c_index)
                     champion_info_array[6] = curr_champ.stars / 3
@@ -437,66 +572,38 @@ class Player:
                         elif item in item_builds.keys():
                             i_index = list(item_builds.keys()).index(item) + 1 + len(uncraftable_items)
                         champion_info_array[start:finish] = utils.item_binary_encode(i_index)
+                    self.bench_mask[x_bench] = 1
+                    if len(curr_champ.items) > 0 and curr_champ.items[-1] == "sparring_gloves":
+                        self.glove_item_mask[x_bench + 27] = 1
+    
                 else:
-                    # Different from the board vector because it needs to match the MCTS encoder
-                    self.board_mask[7 * y + x] = 0
-
-                # Fit the area into the designated spot in the vector
-                self.board_vector[x * 4 + y:x * 4 + y + 26] = champion_info_array
-
-        if self.num_units_in_play == self.max_units:
-            self.util_mask[0] = 0
-        else:
-            self.util_mask[0] = 1
-
-    """
-    Description - Generates the bench vector. The same encoding style for the board is used for the bench.
-    """
-    def generate_bench_vector(self):
-        space = 0
-        bench = np.zeros(config.BENCH_SIZE * config.CHAMP_ENCODING_SIZE)
-        for x_bench in range(len(self.bench)):
-            # when using binary encoding (6 champ  + stars + chosen + 3 * 6 item) = 26
-            champion_info_array = np.zeros(6 * 4 + 2)
-            if self.bench[x_bench]:
-                curr_champ = self.bench[x_bench]
-                c_index = list(COST.keys()).index(curr_champ.name)
-                champion_info_array[0:6] = utils.champ_binary_encode(c_index)
-                champion_info_array[6] = curr_champ.stars / 3
-                champion_info_array[7] = curr_champ.cost / 5
-                for ind, item in enumerate(curr_champ.items):
-                    start = (ind * 6) + 7
-                    finish = start + 6
-                    i_index = []
-                    if item in uncraftable_items:
-                        i_index = list(uncraftable_items).index(item) + 1
-                    elif item in item_builds.keys():
-                        i_index = list(item_builds.keys()).index(item) + 1 + len(uncraftable_items)
-                    champion_info_array[start:finish] = utils.item_binary_encode(i_index)
-                self.bench_mask[x_bench] = 1
-            else:
-                if x_bench == 9:
-                    print("length of bench = {}".format(len(self.bench)))
-                self.bench_mask[x_bench] = 0
-                space = 1
-            bench[x_bench * config.CHAMP_ENCODING_SIZE:
-                  x_bench * config.CHAMP_ENCODING_SIZE + config.CHAMP_ENCODING_SIZE] = champion_info_array
-        self.bench_vector = bench
-        self.util_mask[1] = space
+                    if x_bench == 9:
+                        print("length of bench = {}".format(len(self.bench)))
+                    self.bench_mask[x_bench] = 0
+                    self.glove_item_mask[x_bench + 27] = 0
+                    space = 1
+                bench[x_bench * config.CHAMP_ENCODING_SIZE:
+                      x_bench * config.CHAMP_ENCODING_SIZE + config.CHAMP_ENCODING_SIZE] = champion_info_array
+            self.bench_vector = bench
+            self.util_mask[1] = space
 
     """
     Description - Generates the chosen vector, this uses binary encoding of the index in possible chosen traits. 
     """
     def generate_chosen_vector(self):
-        output_array = np.zeros(5)
-        if self.chosen:
-            i_index = list(self.team_composition.keys()).index(self.chosen)
-            # This should update the item name section of the vector
-            for z in range(5, 0, -1):
-                if i_index > 2 * z:
-                    output_array[5 - z] = 1
-                    i_index -= 2 * z
-        self.chosen_vector = output_array
+        
+        if SPARSE_IMAGE_OBS:
+            pass
+        else:
+            output_array = np.zeros(5)
+            if self.chosen:
+                i_index = list(self.team_composition.keys()).index(self.chosen)
+                # This should update the item name section of the vector
+                for z in range(5, 0, -1):
+                    if i_index > 2 * z:
+                        output_array[5 - z] = 1
+                        i_index -= 2 * z
+            self.chosen_vector = output_array
 
     """
     Description - Generates the item vector. This is done using binary encoding.
@@ -504,89 +611,167 @@ class Player:
     # return output_array
     # TODO: Make champion_duplicator work when bench is full and can upgrade rank
     def generate_item_vector(self):
-        item_arr = np.zeros(config.MAX_BENCH_SPACE * 6)
-        for ind, item in enumerate(self.item_bench):
-            item_info = np.zeros(6)
-            if item == 'champion_duplicator' and self.bench_full():
-                item_info = utils.item_binary_encode(list(uncraftable_items).index(item) + 1)
-                self.item_mask[ind] = 0
-            elif item in uncraftable_items:
-                item_info = utils.item_binary_encode(list(uncraftable_items).index(item) + 1)
-                self.item_mask[ind] = 1
-            elif item in item_builds.keys():
-                item_info = utils.item_binary_encode(list(item_builds.keys()).index(item) + 1 + len(uncraftable_items))
-                self.item_mask[ind] = 1
-            else:
-                self.item_mask[ind] = 0
-            item_arr[ind*6:ind*6 + 6] = item_info
-        self.item_vector = item_arr
+        
+        if SPARSE_IMAGE_OBS:
+            item_bench_array = np.zeros((1, 10, 128))
+            for ind, item in enumerate(self.item_bench):
+                if item and list(items).index(item):
+                	  item_bench_array[0, ind, 65 + list(items).index(item)] += 1
+                
+                if item == 'champion_duplicator' and self.bench_full():
+                    self.item_mask[ind] = 0
+                elif item in uncraftable_items:
+                    self.item_mask[ind] = 1
+                elif item in item_builds.keys():
+                    self.item_mask[ind] = 1
+                else:
+                    self.item_mask[ind] = 0
+            self.sparse_private_image_vector[7, 1:11, :] = item_bench_array
+            self.sparse_public_image_vector[7, 1:11, :] = item_bench_array
+
+        else:
+            
+            item_arr = np.zeros(config.MAX_BENCH_SPACE * 6)
+            for ind, item in enumerate(self.item_bench):
+                item_info = np.zeros(6)
+                if item == 'champion_duplicator' and self.bench_full():
+                    item_info = utils.item_binary_encode(list(uncraftable_items).index(item) + 1)
+                    self.item_mask[ind] = 0
+                elif item in uncraftable_items:
+                    item_info = utils.item_binary_encode(list(uncraftable_items).index(item) + 1)
+                    self.item_mask[ind] = 1
+                elif item in item_builds.keys():
+                    item_info = utils.item_binary_encode(list(item_builds.keys()).index(item) + 1 + len(uncraftable_items))
+                    self.item_mask[ind] = 1
+                else:
+                    self.item_mask[ind] = 0
+                item_arr[ind*6:ind*6 + 6] = item_info
+            self.item_vector = item_arr
 
     """
     Description - All information that other players do not have access to is stored in this vector
     """
     def generate_private_player_vector(self):
-        self.player_private_vector[0] = self.gold / 100
-        self.player_private_vector[1] = self.exp / 100
-        self.player_private_vector[2] = self.round / 30
-
-        exp_to_level = 0
-        if self.level < self.max_level:
-            exp_to_level = self.level_costs[self.level] - self.exp
-        self.player_private_vector[4] = exp_to_level
-        self.player_private_vector[5] = max(self.win_streak, self.loss_streak)
-        if len(self.match_history) > 2:
-            self.player_private_vector[6] = self.match_history[-3]
-            self.player_private_vector[7] = self.match_history[-2]
-            self.player_private_vector[8] = self.match_history[-1]
-        # Who we can play against in the next round. / 20 to keep numbers between 0 and 1.
-        # TODO: Figure out a better way to get around this nested if statement that doesn't involve iterating over
-        # TODO: The entire list
-        for x in range(9, 17):
-            if (x - 9) < self.player_num:
-                if ("player_" + str(x - 9)) in self.opponent_options:
-                    self.player_private_vector[x] = self.opponent_options["player_" + str(x - 9)] / 20
-                else:
-                    self.player_private_vector[x] = -1
-            elif (x - 0) > self.player_num:
-                if ("player_" + str(x - 9)) in self.opponent_options:
-                    self.player_private_vector[x - 1] = self.opponent_options["player_" + str(x - 9)] / 20
-                else:
-                    self.player_private_vector[x - 1] = -1
-
-        # Decision mask parameters
-        if self.level == self.max_level:
+           
+        if SPARSE_IMAGE_OBS:
+            private_image_gold_vector = np.zeros((1, 1, 128))
+            private_image_gold_vector[0, 0, self.gold//10] = 1.  
+            private_image_gold_vector[0, 0, self.gold // 10 + 1] = (self.gold - self.gold // 10) / 10
+            
+            exp_to_level = 0
+            if self.level < self.max_level:
+                exp_to_level = self.level_costs[self.level] - self.exp
+            private_image_exp_vector = np.zeros((1, 1, 128))
+            private_image_exp_vector[0, 0, exp_to_level // 10] = 1
+            private_image_exp_vector[0, 0, exp_to_level // 10 + 1] = (exp_to_level - exp_to_level // 10) / 10
+            
+            private_image_round_vector = np.zeros((1, 1, 128))
+            private_image_round_vector[0, 0, self.round] = 1
+            
+            private_image_health_vector = np.zeros((1, 1, 128))
+            private_image_health_vector[0, 0, self.health // 10] = 1
+            private_image_health_vector[0, 0, self.health // 10 + 1] = (self.health - self.health // 10) / 10
+                    
+            private_image_level_vector = np.zeros((1, 1, 128))
+            private_image_level_vector[0, 0, self.level] = 1
+            
+            private_image_maxteamsize_vector = np.zeros((1, 1, 128))
+            private_image_maxteamsize_vector[0, 0, self.max_units] = 1
+            
+            self.sparse_private_image_vector[14, 1, :] = private_image_gold_vector
+            self.sparse_private_image_vector[14, 2, :] = private_image_health_vector
+            self.sparse_private_image_vector[14, 3, :] = private_image_level_vector
+            self.sparse_private_image_vector[14, 4, :] = private_image_exp_vector
+            self.sparse_private_image_vector[14, 5, :] = private_image_maxteamsize_vector
+            self.sparse_private_image_vector[14, 7, :] = private_image_round_vector
+            
+            
+        else:
+        
+            self.player_private_vector[0] = self.gold / 100
+            self.player_private_vector[1] = self.exp / 100
+            self.player_private_vector[2] = self.round / 30
+    
+            exp_to_level = 0
+            if self.level < self.max_level:
+                exp_to_level = self.level_costs[self.level] - self.exp
+            self.player_private_vector[4] = exp_to_level
+            self.player_private_vector[5] = max(self.win_streak, self.loss_streak)
+            if len(self.match_history) > 2:
+                self.player_private_vector[6] = self.match_history[-3]
+                self.player_private_vector[7] = self.match_history[-2]
+                self.player_private_vector[8] = self.match_history[-1]
+            # Who we can play against in the next round. / 20 to keep numbers between 0 and 1.
+            # TODO: Figure out a better way to get around this nested if statement that doesn't involve iterating over
+            # TODO: The entire list
+            for x in range(9, 17):
+                if (x - 9) < self.player_num:
+                    if ("player_" + str(x - 9)) in self.opponent_options:
+                        self.player_private_vector[x] = self.opponent_options["player_" + str(x - 9)] / 20
+                    else:
+                        self.player_private_vector[x] = -1
+                elif (x - 0) > self.player_num:
+                    if ("player_" + str(x - 9)) in self.opponent_options:
+                        self.player_private_vector[x - 1] = self.opponent_options["player_" + str(x - 9)] / 20
+                    else:
+                        self.player_private_vector[x - 1] = -1
+    
+        # if gold < 4 or already max level, do not allow to level
+        if self.level == self.max_level or self.gold < 4:
             self.decision_mask[4] = 0
-        # if gold < 4, do not allow to level
-        if self.gold < 4:
-            self.decision_mask[4] = 0
-            # Can not roll down to 0 gold
-            self.decision_mask[5] = 0
         else:
             self.decision_mask[4] = 1
+
+        # If gold < 2, do not allow to roll
+        if self.gold < 2:
+            self.decision_mask[5] = 0
+        else:
             self.decision_mask[5] = 1
 
         for idx, cost in enumerate(self.shop_costs):
             if self.gold < cost or cost == 0:
                 self.shop_mask[idx] = 0
-            elif self.gold >= cost:
+            else:
                 self.shop_mask[idx] = 1
 
     """
     Description - All game state information that other players have access to is stored here..
     """
     def generate_public_player_vector(self):
-        self.player_private_vector[0] = self.health / 100
-        self.player_public_vector[1] = self.level / 10
-        self.player_public_vector[2] = self.max_units / 10
-        self.player_private_vector[3] = self.max_units / 10
-        self.player_public_vector[4] = self.num_units_in_play / self.max_units
-        self.player_public_vector[5] = min(floor(self.gold / 10), 5) / 5.0
-        streak_lvl = 0
-        if self.win_streak == 4:
-            streak_lvl = 0.5
-        elif self.win_streak >= 5:
-            streak_lvl = 1
-        self.player_private_vector[6] = streak_lvl
+        
+        if SPARSE_IMAGE_OBS:
+            public_image_gold_vector = np.zeros((1, 1, 128))
+            public_image_gold_vector[0, 0, np.clip(self.gold//10, 0, 5)] = 1.     
+            
+            public_image_health_vector = np.zeros((1, 1, 128))
+            public_image_health_vector[0, 0, self.health // 10] = 1
+            public_image_health_vector[0, 0, self.health // 10 + 1] = (self.health - self.health // 10) / 10
+                    
+            public_image_level_vector = np.zeros((1, 1, 128))
+            public_image_level_vector[0, 0, self.level] = 1
+            
+            public_image_maxteamsize_vector = np.zeros((1, 1, 128))
+            public_image_maxteamsize_vector[0, 0, self.max_units] = 1
+            
+            self.sparse_public_image_vector[14, 1, :] = public_image_gold_vector
+            self.sparse_public_image_vector[14, 2, :] = public_image_health_vector
+            self.sparse_public_image_vector[14, 3, :] = public_image_level_vector
+            self.sparse_public_image_vector[14, 5, :] = public_image_maxteamsize_vector
+            
+  
+        else:
+            self.player_private_vector[0] = self.health / 100
+            self.player_public_vector[1] = self.level / 10
+            self.player_public_vector[2] = self.max_units / 10
+            self.player_private_vector[3] = self.max_units / 10
+            self.player_public_vector[4] = self.num_units_in_play / self.max_units
+            self.player_public_vector[5] = min(floor(self.gold / 10), 5) / 5.0
+            streak_lvl = 0
+            if self.win_streak == 4:
+                streak_lvl = 0.5
+            elif self.win_streak >= 5:
+                streak_lvl = 1
+            self.player_private_vector[6] = streak_lvl
 
     """
     Description - So we can call one method instead of 2 in the dozen or so places where these vectors get updated.
@@ -805,7 +990,9 @@ class Player:
                 return True
         self.reward += self.mistake_reward
         if DEBUG:
-            print(f"Outside board range, bench: {self.bench[bench_x]}, board: {self.board[board_x][board_y]}, bench_x: {bench_x}, board_x: {board_x}, board_y: {board_y}, util_mask: {self.util_mask[0]}")
+            print(f"Outside board range, bench: {self.bench[bench_x]}, board: {self.board[board_x][board_y]}, \
+                             bench_x: {bench_x}, board_x: {board_x}, board_y: {board_y}, util_mask: {self.util_mask[0]}, \
+                             with units in play {self.num_units_in_play} and max units {self.max_units}")
         return False
 
     """
@@ -995,7 +1182,7 @@ class Player:
                         item_trait = list(trait_items.keys())[trait]
                         if item_trait in champ.origin:
                             if DEBUG:
-                                print("Trying to add item to unit with that trait")
+                                print("Trying to add trait item to unit with that trait")
                             return False
                         else:
                             champ.origin.append(item_trait)
@@ -1004,8 +1191,6 @@ class Player:
                 if len(champ.items) > 0:
                     # implement the item combinations here. Make exception with thieves gloves
                     if champ.items[-1] in basic_items and self.item_bench[xBench] in basic_items:
-                        coord = utils.x_y_to_1d_coord(champ.x, champ.y)
-                        self.glove_item_mask[coord] = 0
                         item_build_values = item_builds.values()
                         item_index = 0
                         item_names = list(item_builds.keys())
@@ -1019,7 +1204,7 @@ class Player:
                                 item_trait = list(trait_items.keys())[trait]
                                 if item_trait in champ.origin:
                                     if DEBUG:
-                                        print("trying to add trait item to unit with that trait")
+                                        print("trying to combine trait item to unit with that trait")
                                     return False
                                 else:
                                     champ.origin.append(item_trait)
@@ -1027,7 +1212,7 @@ class Player:
                         if item_names[item_index] == "thieves_gloves":
                             if champ.num_items != 1:
                                 if DEBUG:
-                                    print("Trying to add thieves gloves to unit with a separate item")
+                                    print("Trying to combine thieves gloves in unit with a separate item",  x, y)
                                 return False
                             else:
                                 self.thieves_gloves_loc.append([x, y])
@@ -1037,17 +1222,14 @@ class Player:
                         if champ.items[0] == 'thieves_gloves':
                             self.thieves_gloves(x, y)
                         self.reward += .2 * self.item_reward
-                        self.print(
-                            ".2 reward for combining two basic items into a {}".format(item_names[item_index]))
+                        self.print("{} reward for combining two basic items into a {}"
+                                   .format(.2 * self.item_reward, item_names[item_index]))
                     elif champ.items[-1] in basic_items and self.item_bench[xBench] not in basic_items:
                         basic_piece = champ.items.pop()
                         champ.items.append(self.item_bench[xBench])
                         champ.items.append(basic_piece)
                         self.item_bench[xBench] = None
                     else:
-                        if self.item_bench[xBench] == "sparring_gloves":
-                            coord = utils.x_y_to_1d_coord(champ.x, champ.y)
-                            self.glove_item_mask[coord] = 1
                         champ.items.append(self.item_bench[xBench])
                         self.item_bench[xBench] = None
                 else:
@@ -1069,7 +1251,11 @@ class Player:
         # last case where 3 items but the last item is a basic item and the item to input is also a basic item
         self.reward += self.mistake_reward
         if DEBUG:
-            print(f"Failed to add item {self.item_bench[xBench]}")
+            print(
+                f"Failed to add item {self.item_bench[xBench]} in slot {xBench} to {champ} in {x}, {y}, "
+                f"item_mask: {self.item_mask}")
+            if champ:
+                print(f'{champ} had {len(champ.items)} items')
         return False
 
     """
@@ -1393,6 +1579,11 @@ class Player:
         if s_champion.chosen:
             self.chosen = False
         if s_champion.x != -1 and s_champion.y != -1:
+            if self.board[s_champion.x][s_champion.y].name == 'azir':
+                coords = self.board[s_champion.x][s_champion.y].sandguard_overlord_coordinates
+                self.board[s_champion.x][s_champion.y].overlord = False
+                for coord in coords:
+                    self.board[coord[0]][coord[1]] = None
             self.board[s_champion.x][s_champion.y] = None
             self.generate_board_vector()
         if field:
@@ -1453,7 +1644,6 @@ class Player:
     Inputs      - t_round: Int
                     current game round
     """
-    # TODO Organize methods to be alphabetical so people can find what they are looking for in this file. This file only
     def start_round(self, t_round):
         self.start_time = time.time_ns()
         self.round = t_round
