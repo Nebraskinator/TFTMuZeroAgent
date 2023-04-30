@@ -405,7 +405,7 @@ class RepresentationCNN(torch.nn.Module):
         self.resblocks = torch.nn.ModuleList(
             [ResidualBlock(num_channels) for _ in range(num_blocks)]
         )
-        self.lin = torch.nn.Linear(self.dims[1] * self.dims[2] * config.SPARSE_IMAGE_NUM_CHANNELS * 8, config.HIDDEN_STATE_SIZE).cuda()
+        self.lin = torch.nn.Linear(self.dims[1] * self.dims[2] * config.SPARSE_IMAGE_NUM_CHANNELS, config.HEAD_HIDDEN_SIZE).cuda()
 
     def forward(self, x):
         if self.downsample:
@@ -417,7 +417,7 @@ class RepresentationCNN(torch.nn.Module):
 
         for block in self.resblocks:
             x = block(x)
-        x = torch.flatten(x)
+        x = torch.nn.Flatten(1, -1)(x)
         x = self.lin(x)
         return x
     def __call__(self, x):
